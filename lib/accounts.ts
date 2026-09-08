@@ -316,6 +316,7 @@ export class AccountManager {
 	private saveDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 	private pendingSave: Promise<void> | null = null;
 	private readonly storagePathState: StoragePathState;
+	private readonly selectionStoragePath = getStoragePath();
 	/**
 	 * Manual pin set by the `switch` CLI command, hydrated from disk at
 	 * construction time and refreshed from disk just before each
@@ -330,6 +331,12 @@ export class AccountManager {
 	 * as `pinnedAccountIndex`. See #474.
 	 */
 	private affinityGeneration: number;
+	// A 429 observed during an unreadable selection must survive the next
+	// reconciliation. Keep only those new markers, not the stale account map.
+	private readonly unsequencedRateLimits = new WeakMap<ManagedAccount, {
+		limits: RateLimitStateV3;
+		reason: RateLimitReason;
+	}>();
 	/**
 	 * PR-N / R4: feature-flagged routing mutex mode.
 	 * Defaults to `"legacy"` to preserve pre-PR-N behaviour for one release
@@ -744,7 +751,10 @@ export class AccountManager {
 		resetAllCircuitBreakers();
 	}
 
-	/** Apply each explicit selection once, without erasing a subsequent 429. */
+	/**
+	 * Apply each explicit selection once without erasing a subsequent 429.
+	 * @param meta Latest successfully read selection generation and pin.
+	 */
 	applyManualSelection(meta: {
 		pinnedAccountIndex?: number | null;
 		affinityGeneration: number;
@@ -756,7 +766,10 @@ export class AccountManager {
 			: null;
 		if (account) {
 			clearAllRateLimits(account);
-			account.lastRateLimitReason = undefined;
+			const pending = this.unsequencedRateLimits.get(account);
+			Object.assign(account.rateLimitResetTimes, pending?.limits);
+			account.lastRateLimitReason = pending?.reason;
+			this.unsequencedRateLimits.delete(account);
 		}
 		this.pinnedAccountIndex = account ? index ?? undefined : undefined;
 		this.affinityGeneration = meta.affinityGeneration;
@@ -1285,6 +1298,17 @@ export class AccountManager {
 		reason: RateLimitReason,
 		model?: string | null,
 	): void {
+		let selectionReadable = false;
+		try {
+			const meta = readPinAndGenFromDisk(this.selectionStoragePath, { strict: true });
+			// Observe a switch BEFORE recording this response, not at the later
+			// debounced save where it would erase a genuine post-switch 429.
+			this.applyManualSelection(meta);
+			selectionReadable = true;
+		} catch {
+			// Fail closed: retain this new limit if the selection cannot be read.
+			log.warn("Rate limit recorded while account selection metadata is unavailable");
+		}
 		// Clamp to MAX_RATE_LIMIT_DELAY_MS so a bogus upstream retry-after value
 		// cannot wedge this account unavailable for years (see stress audit H1).
 		const retryMs = Math.min(
@@ -1292,11 +1316,14 @@ export class AccountManager {
 			MAX_RATE_LIMIT_DELAY_MS,
 		);
 		const resetAt = nowMs() + retryMs;
+		const pending = this.unsequencedRateLimits.get(account);
+		const newLimits: RateLimitStateV3 = { ...pending?.limits };
 
 		const baseKey = getQuotaKey(family);
 		if (!model || reason === "quota" || reason === "unknown") {
 			const currentResetAt = account.rateLimitResetTimes[baseKey] ?? 0;
 			account.rateLimitResetTimes[baseKey] = Math.max(currentResetAt, resetAt);
+			newLimits[baseKey] = Math.max(newLimits[baseKey] ?? 0, resetAt);
 		}
 
 		if (
@@ -1306,9 +1333,15 @@ export class AccountManager {
 			const modelKey = getQuotaKey(family, model);
 			const currentResetAt = account.rateLimitResetTimes[modelKey] ?? 0;
 			account.rateLimitResetTimes[modelKey] = Math.max(currentResetAt, resetAt);
+			newLimits[modelKey] = Math.max(newLimits[modelKey] ?? 0, resetAt);
 		}
 
 		account.lastRateLimitReason = reason;
+		if (!selectionReadable) {
+			this.unsequencedRateLimits.set(account, { limits: newLimits, reason });
+		} else {
+			this.unsequencedRateLimits.delete(account);
+		}
 	}
 
 	markAccountCoolingDown(
@@ -1516,8 +1549,13 @@ export class AccountManager {
 		// See #474.
 		let effectivePinnedAccountIndex = this.pinnedAccountIndex;
 		let effectiveAffinityGeneration = this.affinityGeneration;
-		try {
-			const onDisk = readPinAndGenFromDisk(getStoragePath());
+		{
+			// Never replace a newer disk pin with stale memory after a failed
+			// read. Missing storage is only valid for a never-selected new pool.
+			const onDisk = readPinAndGenFromDisk(getStoragePath(), {
+				strict: true,
+				allowMissing: this.affinityGeneration === 0,
+			});
 			// A delayed save must not resurrect the markers the CLI just cleared.
 			this.applyManualSelection(onDisk);
 			if (onDisk.affinityGeneration > effectiveAffinityGeneration) {
@@ -1539,9 +1577,6 @@ export class AccountManager {
 			// freshest known state without re-reading every time.
 			this.pinnedAccountIndex = effectivePinnedAccountIndex;
 			this.affinityGeneration = effectiveAffinityGeneration;
-		} catch {
-			// Disk read failures fall back to in-memory values; better than
-			// dropping the snapshot save entirely.
 		}
 
 		const snapshot: AccountStorageV3 = {

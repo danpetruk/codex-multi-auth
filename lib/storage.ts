@@ -1391,13 +1391,19 @@ export function bumpStorageAffinityGeneration(
  * persisting routine state (rate-limit hits, cooldowns, etc.) so a CLI
  * `switch`/`unpin` that landed between proxy startup and the save is not
  * clobbered. Returns `pinnedAccountIndex: undefined` and
- * `affinityGeneration: 0` on any failure. See issue #474.
+ * `affinityGeneration: 0` on any failure by default. Strict callers reject
+ * unreadable/invalid metadata so persistence cannot overwrite a newer pin.
+ * `allowMissing` permits initial storage creation, but not other read failures.
+ * See issue #474.
  */
-export function readPinAndGenFromDisk(path: string): {
+export function readPinAndGenFromDisk(path: string, options?: {
+	strict: boolean;
+	allowMissing?: boolean;
+}): {
 	pinnedAccountIndex: number | undefined;
 	affinityGeneration: number;
 } {
-	if (!existsSync(path)) {
+	if (!options?.strict && !existsSync(path)) {
 		return { pinnedAccountIndex: undefined, affinityGeneration: 0 };
 	}
 	try {
@@ -1407,6 +1413,14 @@ export function readPinAndGenFromDisk(path: string): {
 			affinityGeneration?: unknown;
 		};
 		const rawPin = parsed.pinnedAccountIndex;
+		if (options?.strict && (
+			!isRecord(parsed) ||
+			(rawPin !== undefined && (!Number.isSafeInteger(rawPin) || Number(rawPin) < 0)) ||
+			(parsed.affinityGeneration !== undefined &&
+				(!Number.isSafeInteger(parsed.affinityGeneration) || Number(parsed.affinityGeneration) < 0))
+		)) {
+			throw new Error("Invalid account selection metadata");
+		}
 		const pinnedAccountIndex =
 			typeof rawPin === "number" &&
 			Number.isFinite(rawPin) &&
@@ -1423,7 +1437,11 @@ export function readPinAndGenFromDisk(path: string): {
 				? rawGen
 				: 0;
 		return { pinnedAccountIndex, affinityGeneration };
-	} catch {
+	} catch (error) {
+		if (options?.strict && !(options.allowMissing &&
+			(error as NodeJS.ErrnoException).code === "ENOENT")) {
+			throw new Error("Unable to read account selection metadata");
+		}
 		return { pinnedAccountIndex: undefined, affinityGeneration: 0 };
 	}
 }

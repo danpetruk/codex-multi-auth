@@ -1144,13 +1144,28 @@ async function handleRequestInner(
 		// otherwise glue an in-flight chat thread to the previously selected
 		// account. The proxy itself never bumps the generation, so its own
 		// debounced disk writes do not clear affinity. See issue #474.
-		const storageMeta = readStorageMetaFromDisk();
-		// Also update managers retained by in-flight requests. Their later saves
-		// must not restore the pre-switch block. Generation guards make this a
-		// one-time retry per explicit switch, never a bypass on every request.
-		for (const manager of state.knownAccountManagers) {
-			manager.applyManualSelection(storageMeta);
-		}
+		/** Reconcile once before selection or recording a new upstream observation. */
+		const reconcileManualSelection = () => {
+			const meta = readStorageMetaFromDisk();
+			for (const manager of state.knownAccountManagers) {
+				manager.applyManualSelection(meta);
+			}
+			if (meta.affinityGeneration > state.lastObservedAffinityGeneration) {
+				const switchedAccount = meta.pinnedAccountIndex === null
+					? null
+					: accountManager.getAccountByIndex(meta.pinnedAccountIndex);
+				if (switchedAccount) {
+					// The trailing separator isolates this account across all models.
+					state.preemptiveQuotaScheduler.clearByPrefix(
+						buildQuotaScheduleKey(switchedAccount, context.family, ""),
+					);
+				}
+				state.sessionAffinityStore?.clearAll();
+				state.lastObservedAffinityGeneration = meta.affinityGeneration;
+			}
+			return meta;
+		};
+		const storageMeta = reconcileManualSelection();
 		// The ephemeral --account pin (issue #623) takes precedence over the
 		// persisted `switch` pin for this invocation, without ever mutating disk
 		// state. Use `??` (not `||`) so a forced index of 0 is honored. When set,
@@ -1188,20 +1203,6 @@ async function handleRequestInner(
 				1,
 				Math.min(state.maxRuntimeAccountAttempts, MAX_PINNED_TRANSIENT_ATTEMPTS),
 			);
-		}
-		if (storageMeta.affinityGeneration > state.lastObservedAffinityGeneration) {
-			const switchedAccount = storageMeta.pinnedAccountIndex === null
-				? null
-				: accountManager.getAccountByIndex(storageMeta.pinnedAccountIndex);
-			if (switchedAccount) {
-				// Include the trailing separator to exclude neighboring identities;
-				// clear all models for this account, not just the current request.
-				state.preemptiveQuotaScheduler.clearByPrefix(
-					buildQuotaScheduleKey(switchedAccount, context.family, ""),
-				);
-			}
-			state.sessionAffinityStore?.clearAll();
-			state.lastObservedAffinityGeneration = storageMeta.affinityGeneration;
 		}
 
 		let runtimeSelectionIterations = 0;
@@ -1515,6 +1516,7 @@ async function handleRequestInner(
 				noteRotation();
 				continue;
 			}
+			reconcileManualSelection();
 			const quotaSnapshot = readQuotaSchedulerSnapshot(
 				upstream.headers,
 				upstream.status,
@@ -1530,6 +1532,8 @@ async function handleRequestInner(
 					parseRetryAfterHeaderMs(upstream.headers, state.now()) ??
 					parseRetryAfterBodyMs(bodyText, state.now()) ??
 					60_000;
+				// Reading the body awaited I/O; a switch may have landed meanwhile.
+				reconcileManualSelection();
 				state.preemptiveQuotaScheduler.markRateLimited(
 					quotaScheduleKey,
 					retryAfterMs,

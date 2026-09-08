@@ -338,7 +338,10 @@ export class PreemptiveQuotaScheduler {
 		return { defer: false, waitMs: 0 };
 	}
 
-	/** Forget cached quota observations for one caller-defined account prefix. */
+	/**
+	 * Forget cached quota observations for one account across its model keys.
+	 * @param prefix Account key including its trailing separator; empty is a no-op.
+	 */
 	clearByPrefix(prefix: string): void {
 		if (!prefix) return;
 		for (const key of this.snapshots.keys()) {
