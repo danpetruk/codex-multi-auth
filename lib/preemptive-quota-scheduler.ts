@@ -338,6 +338,14 @@ export class PreemptiveQuotaScheduler {
 		return { defer: false, waitMs: 0 };
 	}
 
+	/** Forget cached quota observations for one caller-defined account prefix. */
+	clearByPrefix(prefix: string): void {
+		if (!prefix) return;
+		for (const key of this.snapshots.keys()) {
+			if (key.startsWith(prefix)) this.snapshots.delete(key);
+		}
+	}
+
 	prune(now = Date.now()): number {
 		let removed = 0;
 		for (const [key, snapshot] of this.snapshots.entries()) {

@@ -744,6 +744,24 @@ export class AccountManager {
 		resetAllCircuitBreakers();
 	}
 
+	/** Apply each explicit selection once, without erasing a subsequent 429. */
+	applyManualSelection(meta: {
+		pinnedAccountIndex?: number | null;
+		affinityGeneration: number;
+	}): void {
+		if (meta.affinityGeneration <= this.affinityGeneration) return;
+		const index = meta.pinnedAccountIndex;
+		const account = typeof index === "number"
+			? this.getAccountByIndex(index)
+			: null;
+		if (account) {
+			clearAllRateLimits(account);
+			account.lastRateLimitReason = undefined;
+		}
+		this.pinnedAccountIndex = account ? index ?? undefined : undefined;
+		this.affinityGeneration = meta.affinityGeneration;
+	}
+
 	/**
 	 * Wipe per-account transient state — active cooldowns and all rate-limit
 	 * reset windows — across every managed account, then schedule a debounced
@@ -1500,6 +1518,8 @@ export class AccountManager {
 		let effectiveAffinityGeneration = this.affinityGeneration;
 		try {
 			const onDisk = readPinAndGenFromDisk(getStoragePath());
+			// A delayed save must not resurrect the markers the CLI just cleared.
+			this.applyManualSelection(onDisk);
 			if (onDisk.affinityGeneration > effectiveAffinityGeneration) {
 				effectiveAffinityGeneration = onDisk.affinityGeneration;
 				// The pin is part of the same atomic write the CLI performs when

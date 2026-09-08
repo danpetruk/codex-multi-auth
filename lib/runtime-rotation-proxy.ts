@@ -1145,6 +1145,12 @@ async function handleRequestInner(
 		// account. The proxy itself never bumps the generation, so its own
 		// debounced disk writes do not clear affinity. See issue #474.
 		const storageMeta = readStorageMetaFromDisk();
+		// Also update managers retained by in-flight requests. Their later saves
+		// must not restore the pre-switch block. Generation guards make this a
+		// one-time retry per explicit switch, never a bypass on every request.
+		for (const manager of state.knownAccountManagers) {
+			manager.applyManualSelection(storageMeta);
+		}
 		// The ephemeral --account pin (issue #623) takes precedence over the
 		// persisted `switch` pin for this invocation, without ever mutating disk
 		// state. Use `??` (not `||`) so a forced index of 0 is honored. When set,
@@ -1184,6 +1190,16 @@ async function handleRequestInner(
 			);
 		}
 		if (storageMeta.affinityGeneration > state.lastObservedAffinityGeneration) {
+			const switchedAccount = storageMeta.pinnedAccountIndex === null
+				? null
+				: accountManager.getAccountByIndex(storageMeta.pinnedAccountIndex);
+			if (switchedAccount) {
+				// Include the trailing separator to exclude neighboring identities;
+				// clear all models for this account, not just the current request.
+				state.preemptiveQuotaScheduler.clearByPrefix(
+					buildQuotaScheduleKey(switchedAccount, context.family, ""),
+				);
+			}
 			state.sessionAffinityStore?.clearAll();
 			state.lastObservedAffinityGeneration = storageMeta.affinityGeneration;
 		}

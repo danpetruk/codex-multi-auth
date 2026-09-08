@@ -121,6 +121,10 @@ export async function persistAndSyncSelectedAccount({
 	account.lastSwitchReason = switchReason;
 	if (setPin) {
 		storage.pinnedAccountIndex = targetIndex;
+		// A manual switch requests a fresh upstream attempt, including when
+		// reselecting the same account after an out-of-band quota reset.
+		// Real 429 responses will populate these markers again.
+		account.rateLimitResetTimes = {};
 	} else if (clearPin) {
 		delete storage.pinnedAccountIndex;
 	}
