@@ -35,7 +35,7 @@ import {
 	type SelectionRecord,
 } from "./routing-mutex.js";
 import { nowMs } from "./utils.js";
-import { ERROR_MESSAGES, HTTP_STATUS, LUNA_RESERVE_MODEL, MAX_RATE_LIMIT_DELAY_MS } from "./constants.js";
+import { ERROR_MESSAGES, HTTP_STATUS, LUNA_RESERVE_MODEL, RATE_LIMIT_CACHE_TTL_MS } from "./constants.js";
 import { CodexAuthError } from "./errors.js";
 import {
 	loadCodexCliState,
@@ -96,6 +96,7 @@ import {
 	sanitizeEmail,
 } from "./auth/token-utils.js";
 import {
+	boundRateLimitCache,
 	clampNonNegativeInt,
 	getQuotaKey,
 	clearExpiredRateLimits,
@@ -589,7 +590,7 @@ export class AccountManager {
 						addedAt: clampNonNegativeInt(account.addedAt, baseNow),
 						lastUsed: clampNonNegativeInt(account.lastUsed, 0),
 						lastSwitchReason: account.lastSwitchReason,
-						rateLimitResetTimes: account.rateLimitResetTimes ?? {},
+						rateLimitResetTimes: boundRateLimitCache(account.rateLimitResetTimes ?? {}, baseNow),
 						coolingDownUntil: account.coolingDownUntil,
 						cooldownReason: account.cooldownReason,
 						authInvalidatedAt: account.authInvalidatedAt,
@@ -1419,11 +1420,11 @@ export class AccountManager {
 			// Fail closed: retain this new limit if the selection cannot be read.
 			log.warn("Rate limit recorded while account selection metadata is unavailable");
 		}
-		// Clamp to MAX_RATE_LIMIT_DELAY_MS so a bogus upstream retry-after value
-		// cannot wedge this account unavailable for years (see stress audit H1).
+		// A local rejection is authoritative for at most an hour. The next request
+		// then revalidates upstream, including after an out-of-band quota reset.
 		const retryMs = Math.min(
 			Math.max(0, Math.floor(retryAfterMs)),
-			MAX_RATE_LIMIT_DELAY_MS,
+			RATE_LIMIT_CACHE_TTL_MS,
 		);
 		const observedAtMs = nowMs();
 		const resetAt = observedAtMs + retryMs;

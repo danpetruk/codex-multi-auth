@@ -59,6 +59,13 @@ The account pool under `~/.codex/multi-auth` carries over.
 
 ## Changes To Know About
 
+### Hourly rate-limit cache revalidation
+
+Restart existing routers after installing this change. Legacy persisted routing
+deadlines longer than an hour are bounded to one hour from load and retained on
+the next normal save. Already-bounded deadlines are not extended on restart.
+No account migration or reset-credit redemption is required.
+
 ### Compact `status` Output Is The Default
 
 `codex-multi-auth status` and `codex-multi-auth list` now print a compact
