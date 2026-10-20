@@ -313,6 +313,7 @@ export class AccountManager {
 	private readonly persistedWorkspaceSelections = new WeakMap<ManagedAccount, string | undefined>();
 	private readonly persistedWorkspaces = new WeakMap<ManagedAccount, Workspace[] | undefined>();
 	private hadPersistedStorage = false;
+	private hasUnpersistedRateLimitBounds = false;
 	private readonly loadedAccountStorageSnapshot: boolean;
 	private cursorByFamily: Record<ModelFamily, number> = initFamilyState(0);
 	private currentAccountIndexByFamily: Record<ModelFamily, number> =
@@ -380,6 +381,18 @@ export class AccountManager {
 
 		const manager = new AccountManager(authFallback, sourceOfTruthStorage);
 		await manager.hydrateFromCodexCli();
+		if (manager.hasUnpersistedRateLimitBounds) {
+			// Short-lived wrappers may exit without another save; persisting the
+			// bound now keeps each restart from re-bounding from its own load time.
+			try {
+				await manager.saveToDisk(true);
+				manager.hasUnpersistedRateLimitBounds = false;
+			} catch (error) {
+				log.debug("Failed to persist bounded rate-limit deadlines", {
+					error: String(error),
+				});
+			}
+		}
 		return manager;
 	}
 
@@ -558,6 +571,11 @@ export class AccountManager {
 
 					const matchesFallback =
 						!!authFallback && fallbackMatchedRowIndex === index;
+					const storedRateLimits = account.rateLimitResetTimes ?? {};
+					const rateLimitResetTimes = boundRateLimitCache(storedRateLimits, baseNow);
+					if (Object.entries(rateLimitResetTimes).some(([key, until]) => until !== storedRateLimits[key])) {
+						this.hasUnpersistedRateLimitBounds = true;
+					}
 
 					const refreshToken =
 						matchesFallback && authFallback
@@ -590,7 +608,7 @@ export class AccountManager {
 						addedAt: clampNonNegativeInt(account.addedAt, baseNow),
 						lastUsed: clampNonNegativeInt(account.lastUsed, 0),
 						lastSwitchReason: account.lastSwitchReason,
-						rateLimitResetTimes: boundRateLimitCache(account.rateLimitResetTimes ?? {}, baseNow),
+						rateLimitResetTimes,
 						coolingDownUntil: account.coolingDownUntil,
 						cooldownReason: account.cooldownReason,
 						authInvalidatedAt: account.authInvalidatedAt,
