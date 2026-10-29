@@ -5321,6 +5321,157 @@ describe("native login isolation", () => {
 	});
 });
 
+describe("provider re-login while router is running", () => {
+	it("does not let a late rejection of the old token invalidate a new login", async () => {
+		const storage = createStorage(Date.now(), 1);
+		const manager = new AccountManager(undefined, storage);
+		const disk = structuredClone(storage);
+		let releaseOld!: (response: Response) => void;
+		const oldResponse = new Promise<Response>(resolve => { releaseOld = resolve; });
+		let oldSent!: () => void;
+		const sent = new Promise<void>(resolve => { oldSent = resolve; });
+		const { calls, fetchImpl } = createRecordingFetch(call => {
+			if (call.headers.get("authorization") === "Bearer access-1") {
+				oldSent(); return oldResponse;
+			}
+			return textEventStream();
+		});
+		const proxy = await startProxy({ accountManager: manager, fetchImpl, options: {
+			nativeOpenai: false, forcedAccountIndex: 0,
+			readNativeAccountStorage: async () => structuredClone(disk),
+		} });
+		const first = postResponses(proxy, { model: "gpt-5.6-sol", stream: true });
+		await sent;
+		Object.assign(disk.accounts[0]!, { accessToken: "new-login", refreshToken: "new-refresh" });
+		try {
+			const fresh = await postResponses(proxy, { model: "gpt-5.6-sol", stream: true });
+			expect(fresh.status).toBe(200); await fresh.text();
+		} finally {
+			releaseOld(Response.json({ error: { code: "token_revoked", message: "Token has been invalidated" } }, { status: 401 }));
+			await (await first).text();
+		}
+		const next = await postResponses(proxy, { model: "gpt-5.6-sol", stream: true });
+		expect(next.status).toBe(200); await next.text();
+		expect(manager.getAccountByIndex(0)?.authInvalidatedAt).toBeUndefined();
+		expect(calls.slice(1).every(call => call.headers.get("authorization") === "Bearer new-login")).toBe(true);
+	});
+
+	it("recovers a strict pin after re-login without restarting or resetting other state", async () => {
+		const storage = createStorage(Date.now());
+		const manager = new AccountManager(undefined, storage);
+		const disk = structuredClone(storage);
+		const pinned = manager.getAccountByIndex(0)!;
+		const other = manager.getAccountByIndex(1)!;
+		manager.markAuthInvalidated(other);
+		const unrelatedLimit = Date.now() + 600_000;
+		pinned.rateLimitResetTimes["codex:unrelated-model"] = unrelatedLimit;
+		const { calls, fetchImpl } = createRecordingFetch(call =>
+			call.headers.get("authorization") === "Bearer access-1"
+				? Response.json({ error: { code: "token_invalidated", message: "Token has been invalidated" } }, { status: 401 })
+				: textEventStream());
+		const proxy = await startProxy({ accountManager: manager, fetchImpl, options: {
+			nativeOpenai: false, forcedAccountIndex: 0,
+			readNativeAccountStorage: async () => structuredClone(disk),
+		} });
+		const startedAt = proxy.getStatus().startedAt;
+		const first = await postResponses(proxy, { model: "gpt-5.6-sol", stream: true });
+		expect(first.status).toBe(401); await first.text();
+		expect(pinned.authInvalidatedAt).toBeDefined();
+		const blocked = await postResponses(proxy, { model: "gpt-5.6-sol", stream: true });
+		expect(blocked.status).toBe(503);
+		expect((await blocked.json()).error.code).toBe("codex_pinned_account_unavailable");
+		expect(calls).toHaveLength(1);
+		Object.assign(disk.accounts[0]!, {
+			accessToken: "relogin-access", refreshToken: "relogin-refresh",
+			expiresAt: Date.now() + 7_200_000,
+		});
+		for (let i = 0; i < 2; i++) {
+			const recovered = await postResponses(proxy, { model: "gpt-5.6-sol", stream: true });
+			expect(recovered.status).toBe(200); await recovered.text();
+		}
+		expect(proxy.getStatus().startedAt).toBe(startedAt);
+		expect(proxy.getStatus().lastAccountIndex).toBe(0);
+		expect(calls.slice(1).map(c => c.headers.get("authorization"))).toEqual(["Bearer relogin-access", "Bearer relogin-access"]);
+		expect(calls.every(c => c.headers.get("chatgpt-account-id") === "acc_1")).toBe(true);
+		expect(pinned.authInvalidatedAt).toBeUndefined();
+		expect(pinned.cooldownReason).toBeUndefined();
+		expect(pinned.rateLimitResetTimes["codex:unrelated-model"]).toBe(unrelatedLimit);
+		expect(other.authInvalidatedAt).toBeDefined();
+		expect(other.access).toBe("access-2");
+	});
+
+	it.each([undefined, "unknown", "access-1"])("requires the local client key before reading storage: %s", async token => {
+		const manager = new AccountManager(undefined, createStorage(Date.now()));
+		const read = vi.fn(async () => createStorage(Date.now()));
+		const { calls, fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({ accountManager: manager, fetchImpl, options: {
+			nativeOpenai: false, readNativeAccountStorage: read,
+		} });
+		const response = await fetch(`${proxy.baseUrl}/models`, {
+			headers: token ? { authorization: `Bearer ${token}` } : {},
+		});
+		expect(response.status).toBe(401); await response.text();
+		expect(read).not.toHaveBeenCalled();
+		expect(calls).toHaveLength(0);
+	});
+
+	it("keeps a rate-limit block after credential replacement", async () => {
+		const storage = createStorage(Date.now());
+		const manager = new AccountManager(undefined, storage);
+		const disk = structuredClone(storage);
+		const account = manager.getAccountByIndex(0)!;
+		const until = Date.now() + 600_000;
+		account.rateLimitResetTimes[getModelFamily("gpt-5.6-sol")] = until;
+		Object.assign(disk.accounts[0]!, { accessToken: "relogin-access", refreshToken: "relogin-refresh" });
+		const { calls, fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({ accountManager: manager, fetchImpl, options: {
+			nativeOpenai: false, forcedAccountIndex: 0, readNativeAccountStorage: async () => disk,
+		} });
+		const response = await postResponses(proxy, { model: "gpt-5.6-sol", stream: true });
+		expect(response.status).toBe(503); await response.text();
+		expect(account.access).toBe("relogin-access");
+		expect(calls).toHaveLength(0);
+		expect(account.rateLimitResetTimes[getModelFamily("gpt-5.6-sol")]).toBe(until);
+	});
+
+	it("does not route from a missing store and recovers when the store returns", async () => {
+		const storage = createStorage(Date.now(), 1);
+		const manager = new AccountManager(undefined, storage);
+		let disk: AccountStorageV3 | null = null;
+		const { calls, fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({ accountManager: manager, fetchImpl, options: {
+			nativeOpenai: false, forcedAccountIndex: 0, readNativeAccountStorage: async () => disk,
+		} });
+		const missing = await postResponses(proxy, { model: "gpt-5.6-sol", stream: true });
+		expect(missing.status).toBe(503);
+		expect((await missing.json()).error.code).toBe("native_account_storage_unavailable");
+		expect(calls).toHaveLength(0);
+		disk = storage;
+		const recovered = await postResponses(proxy, { model: "gpt-5.6-sol", stream: true });
+		expect(recovered.status).toBe(200); await recovered.text();
+	});
+
+	it("honors disk disablement before dispatch even if credentials were refreshed", async () => {
+		const storage = createStorage(Date.now());
+		const manager = new AccountManager(undefined, storage);
+		const disk = structuredClone(storage);
+		const { calls, fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({ accountManager: manager, fetchImpl, options: {
+			nativeOpenai: false, forcedAccountIndex: 0, readNativeAccountStorage: async () => disk,
+		} });
+		const refresh = vi.spyOn(tokenRefreshRuntime, "ensureFreshAccessToken");
+		refresh.mockImplementationOnce(async params => {
+			disk.accounts[0]!.enabled = false;
+			return { ok: true, accessToken: params.account.access!, account: params.account, accountManager: params.accountManager };
+		});
+		const response = await postResponses(proxy, { model: "gpt-5.6-sol", stream: true });
+		expect(response.status).toBe(503);
+		expect((await response.json()).error.code).toBe("routing_configuration_changed");
+		expect(calls).toHaveLength(0);
+		refresh.mockRestore();
+	});
+});
+
 describe("native re-login while router is running", () => {
 	it("accepts the newly saved credential and drops the obsolete auth cooldown", async () => {
 		const storage = createStorage(Date.now()); const accountManager = new AccountManager(undefined, storage);

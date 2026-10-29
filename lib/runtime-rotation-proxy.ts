@@ -1415,7 +1415,12 @@ async function handleRequestInner(
         let nativeOAuthResult: boolean | undefined;
 		const nativeOAuth = async (): Promise<boolean> =>
 			(nativeOAuthResult ??= !!(state.nativeOpenai && bearer && await isNativeClientToken(bearer, state.now())));
-		if (state.nativeOpenai && state.readNativeAccountStorage) {
+		// Provider-bound routers are long-lived too: login/refresh in another
+		// process replaces credentials without changing the client API key. Sync
+		// before selection so an obsolete auth-invalid marker cannot veto re-login.
+		// Provider mode must authenticate its local key before reading the store;
+		// accepting managed OAuth bearers remains exclusive to native mode.
+		if (state.readNativeAccountStorage && (state.nativeOpenai || apiKeyClient)) {
 			// Screen the caller before account storage can reshape the manager: a
 			// request with no credential never reads disk, and a bearer that matches
 			// nothing we hold (in memory or on disk) is refused before any credential
@@ -3001,7 +3006,7 @@ async function handleRequestInner(
 				continue;
 			}
 
-			if (state.nativeOpenai && state.readNativeAccountStorage) {
+			if (state.readNativeAccountStorage) {
 				const latestSnapshot = await state.readNativeAccountStorage();
                 const latest = latestSnapshot.storage;
                 const retained = latestSnapshot.transientFailure && latestSnapshot.routingAvailable === true && (apiKeyClient || await nativeOAuth())

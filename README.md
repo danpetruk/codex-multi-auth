@@ -127,6 +127,8 @@ codex-multi-auth forecast --live
 
 Common symptoms — wrong active account, OAuth callback port `1455` already bound, Windows/WSL port contention, `EBUSY`/`EPERM` on Windows — are covered in [docs/troubleshooting.md](docs/troubleshooting.md).
 
+After signing in again, a running native or custom-provider router adopts the saved replacement credentials on the next authenticated request. Replacing rejected credentials clears their stale authentication block without restarting the router; account pins and independent quota limits still apply. Unchanged revoked credentials still require a new sign-in.
+
 ## Documentation
 
 | Doc | What it covers |
