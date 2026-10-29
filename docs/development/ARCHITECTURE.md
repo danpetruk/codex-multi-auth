@@ -378,3 +378,14 @@ Official Codex-owned files stay under `~/.codex`: `auth.json`, `accounts.json`, 
 - [REPOSITORY_SCOPE.md](REPOSITORY_SCOPE.md)
 - [../architecture.md](../architecture.md)
 - [../features.md](../features.md)
+
+### Runtime credential serialization
+
+Saved-account reads and refresh commits share a per-manager asynchronous lock,
+including the full persistence step. Manager replacements redirect queued commits
+and reads to the current manager. This prevents a request from reinstalling an
+old on-disk tuple while a successful refresh is still saving. Cross-process refresh
+lease acquisition errors and timeouts return `coordination_error`; the router
+reports `refresh_coordination_unavailable` without recording an authentication
+failure. Expiry never authorizes lock theft, and unsuccessful publication of a
+rotated credential retains its lock.

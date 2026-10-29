@@ -31,6 +31,10 @@ Upgrading from the old prerelease package? See [the legacy note in upgrade.md](u
 
 ---
 
+Saved re-logins are adopted by a running router after this update is installed.
+Refresh coordination errors are reported separately from invalid credentials; see
+[the upgrade notes](upgrade.md#live-credential-reload-and-refresh-coordination).
+
 ## The Commands
 
 | Command | What it does |

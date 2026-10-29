@@ -13,6 +13,10 @@ Use it when one Codex account is not enough: you hit rate limits or quota window
 
 Using OpenCode rather than the Codex CLI? The sibling project [`oc-codex-multi-auth`](https://github.com/ndycode/oc-codex-multi-auth) is the plugin that manages the same kind of account pool there.
 
+Refresh leases block uncoordinated OAuth refresh on lock errors or timeouts.
+For live re-login behavior and interrupted-refresh recovery, see the
+[upgrade notes](docs/upgrade.md#live-credential-reload-and-refresh-coordination).
+
 ## What it does
 
 - **Account pool** — OAuth login for multiple ChatGPT accounts, stored locally under `~/.codex/multi-auth` (files `0600`, directories `0700`), with per-project pools under `projects/<project-key>/`.

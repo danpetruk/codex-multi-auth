@@ -714,3 +714,17 @@ describe("applyMonotonicAuthCooldown", () => {
 		).toBeGreaterThan(firstDeadline);
 	});
 });
+
+it("does not penalize or invalidate a login on a local coordination failure", async () => {
+  const manager = managerWith(STALE_EXPIRES);
+  const before = manager.getAccountsSnapshot();
+  queuedRefreshMock.mockResolvedValue({type: "failed", reason: "coordination_error"});
+  const failure = vi.spyOn(manager, "recordFailure");
+  const authFailure = vi.spyOn(manager, "incrementAuthFailures");
+  const result = await ensureFreshAccessToken(refreshParams(manager));
+  expect(result).toMatchObject({ok: false, retryable: true});
+  expect(manager.getAccountsSnapshot()).toEqual(before);
+  expect(failure).not.toHaveBeenCalled();
+  expect(authFailure).not.toHaveBeenCalled();
+  expect(saveAccountsMock).not.toHaveBeenCalled();
+});

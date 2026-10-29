@@ -60,6 +60,30 @@ let runtimeRefreshCommitQueues = new WeakMap<
 >();
 let runtimeRefreshManagerRedirects = new WeakMap<AccountManager, AccountManager>();
 
+let runtimeCredentialLocks = new WeakMap<AccountManager, Promise<void>>();
+
+/** Serialize credential snapshots with commits, including their disk writes. */
+export async function withRuntimeCredentialLock<T>(
+	accountManager: AccountManager,
+	operation: () => Promise<T>,
+): Promise<T> {
+	const target = resolveRuntimeRefreshCommitManager(accountManager);
+	const previous = runtimeCredentialLocks.get(target);
+	let release!: () => void;
+	const pending = new Promise<void>(resolve => { release = resolve; });
+	runtimeCredentialLocks.set(target, pending);
+	await previous;
+	try {
+		if (resolveRuntimeRefreshCommitManager(target) !== target) {
+			return await withRuntimeCredentialLock(target, operation);
+		}
+		return await operation();
+	} finally {
+		release();
+		if (runtimeCredentialLocks.get(target) === pending) runtimeCredentialLocks.delete(target);
+	}
+}
+
 function resolveRuntimeRefreshCommitManager(accountManager: AccountManager): AccountManager {
 	let current = accountManager;
 	const seen = new Set<AccountManager>();
@@ -155,6 +179,7 @@ export function resolveRuntimeRefreshTarget(
 
 /** @internal Test-only reset for process-global refresh commit/redirect state. */
 export function resetRuntimeRefreshStateForTests(): void {
+	runtimeCredentialLocks = new WeakMap<AccountManager, Promise<void>>();
 	runtimeRefreshCommitQueues = new WeakMap<
 		AccountManager,
 		Map<string, Promise<RuntimeRefreshCommitResult>>
@@ -204,10 +229,15 @@ async function commitRefreshedAuthOnce(
 	}
 	const existing = queue.get(key);
 	if (existing) return existing;
-	const pending = commitManager
-		.commitRefreshedAuth(account, auth)
-		.then((updatedAccount) => ({ accountManager: commitManager, account: updatedAccount }))
-		.finally(() => queue?.delete(key));
+	const expectedRefresh = account.refreshToken;
+	const pending = withRuntimeCredentialLock(commitManager, async () => {
+		const target = resolveRuntimeRefreshTarget(commitManager, account);
+		if (!target) return { accountManager: resolveRuntimeRefreshCommitManager(commitManager), account: null };
+		// A queued disk sync may have installed a newer login before this commit.
+		if (target.account.refreshToken !== expectedRefresh || target.account.enabled === false) return target;
+		const updatedAccount = await target.accountManager.commitRefreshedAuth(target.account, auth);
+		return { accountManager: target.accountManager, account: updatedAccount };
+	}).finally(() => queue?.delete(key));
 	queue.set(key, pending);
 	return pending;
 }
@@ -227,6 +257,7 @@ export async function ensureFreshAccessToken(params: {
 		ok: false;
 		retryable: boolean;
 		invalidated?: boolean;
+		coordinationFailed?: boolean;
 		selectionRestart?: false;
 		account: ManagedAccount;
 		accountManager: AccountManager;
@@ -338,6 +369,10 @@ export async function ensureFreshAccessToken(params: {
 		};
 	}
 	if (refreshResult.type === "failed") {
+		if (refreshResult.reason === "coordination_error") {
+			// A local lock failure says nothing about the validity of the login.
+			return { ok: false, retryable: true, coordinationFailed: true, account: latestTarget.account, accountManager: latestTarget.accountManager };
+		}
 		latestTarget.accountManager.recordFailure(latestTarget.account, family, model);
 		latestTarget.accountManager.incrementAuthFailures(latestTarget.account);
 		// If the refresh endpoint itself returns an explicit invalidation message

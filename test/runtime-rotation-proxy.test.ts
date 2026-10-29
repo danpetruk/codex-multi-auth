@@ -5322,6 +5322,87 @@ describe("native login isolation", () => {
 });
 
 describe("provider re-login while router is running", () => {
+  it("never installs an old disk snapshot while a refresh commit is saving", async () => {
+    const storage = createStorage(Date.now(), 1);
+    storage.accounts[0]!.expiresAt = Date.now() - 1000;
+    const manager = new AccountManager(undefined, storage);
+    const disk = structuredClone(storage);
+    let release!: () => void, started!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const entered = new Promise<void>(resolve => { started = resolve; });
+    const read = vi.fn(async () => structuredClone(disk));
+    const commit = vi.spyOn(manager, "commitRefreshedAuth").mockImplementation(async (account, auth) => {
+      Object.assign(account, {access: auth.access, refreshToken: auth.refresh, expires: auth.expires});
+      started(); await gate;
+      Object.assign(disk.accounts[0]!, {accessToken: auth.access, refreshToken: auth.refresh, expiresAt: auth.expires});
+      return account;
+    });
+    refreshAccessTokenMock.mockResolvedValue({type: "success", access: "rotated-access", refresh: "rotated-refresh", expires: Date.now() + 3600000});
+    const {calls, fetchImpl} = createRecordingFetch(() => textEventStream());
+    const proxy = await startProxy({accountManager: manager, fetchImpl, options: {
+      nativeOpenai: false, forcedAccountIndex: 0, readNativeAccountStorage: read,
+    }});
+    const first = postResponses(proxy, {model: "gpt-5.6-sol", stream: true});
+    await entered;
+    const readCount = read.mock.calls.length;
+    const second = postResponses(proxy, {model: "gpt-5.6-sol", stream: true});
+    let responses: Response[] = [];
+    try {
+      // Give the second HTTP request time to reach the credential boundary.
+      await new Promise(resolve => setTimeout(resolve, 60));
+      expect(read).toHaveBeenCalledTimes(readCount);
+      expect(manager.getAccountByIndex(0)?.refreshToken).toBe("rotated-refresh");
+    } finally {
+      release();
+      responses = await Promise.all([first, second]);
+      await Promise.all(responses.map(response => response.text()));
+    }
+    expect(responses.map(response => response.status)).toEqual([200, 200]);
+    expect(calls).toHaveLength(2);
+    expect(calls.every(call => call.headers.get("authorization") === "Bearer rotated-access")).toBe(true);
+    expect(refreshAccessTokenMock).toHaveBeenCalledTimes(1);
+    expect(commit).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports coordination failures without retrying or switching accounts", async () => {
+    const manager = new AccountManager(undefined, createStorage(Date.now(), 2));
+    const {calls, fetchImpl} = createRecordingFetch(() => textEventStream());
+    const proxy = await startProxy({accountManager: manager, fetchImpl});
+    const refresh = vi.spyOn(tokenRefreshRuntime, "ensureFreshAccessToken").mockImplementation(async params => ({
+      ok: false, retryable: true, coordinationFailed: true, account: params.account, accountManager: params.accountManager,
+    }));
+    const before = proxy.getStatus().retries;
+    const response = await postResponses(proxy, {model: "gpt-5.6-sol", stream: true});
+    expect(response.status).toBe(503);
+    expect((await response.json()).error.code).toBe("refresh_coordination_unavailable");
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(calls).toHaveLength(0);
+    expect(proxy.getStatus().retries).toBe(before);
+    expect(manager.getAccountsSnapshot().every(account => !account.authInvalidatedAt && !account.cooldownReason)).toBe(true);
+  });
+
+  it.each(["EBUSY", "EPERM", "EACCES"])("keeps API/ZDR routes available when the OAuth store fails cold: %s", async code => {
+    const manager = new AccountManager(undefined, createStorage(Date.now()));
+    const read = vi.fn(async () => { throw Object.assign(new Error("store unavailable"), {code}); });
+    const {calls, fetchImpl} = createRecordingFetch(call => call.url.endsWith("/models")
+      ? Response.json({data: [{id: "exclusive"}]}) : textEventStream());
+    const proxy = await startProxy({accountManager: manager, fetchImpl, options: {
+      nativeOpenai: false, readNativeAccountStorage: read,
+      readApiRoutes: async () => (["api", "zdr"] as const).map(kind => ({id: kind, label: kind, kind, apiKey: "fixture-key", enabled: true, priority: 0, visibleModels: ["exclusive"]})),
+    }});
+    const unauthorized = await postResponses(proxy, {model: "api/exclusive"}, "/responses", {authorization: "Bearer unknown"});
+    expect(unauthorized.status).toBe(401); await unauthorized.text();
+    expect(read).not.toHaveBeenCalled();
+    for (const kind of ["api", "zdr"]) {
+      const response = await postResponses(proxy, {model: `${kind}/exclusive`, input: "test", stream: true});
+      expect(response.status).toBe(200); await response.text();
+    }
+    const oauth = await postResponses(proxy, {model: "gpt-5.6-sol", stream: true});
+    expect(oauth.status).toBe(503);
+    expect((await oauth.json()).error.code).toBe("native_account_storage_unavailable");
+    expect(calls.every(call => call.url.startsWith("https://api.openai.com/"))).toBe(true);
+  });
+
 	it("does not let a late rejection of the old token invalidate a new login", async () => {
 		const storage = createStorage(Date.now(), 1);
 		const manager = new AccountManager(undefined, storage);
@@ -5811,7 +5892,7 @@ describe("native inventory read resilience",()=>{
   for(let i=0;i<2;i++){const response=await getModels(proxy,undefined,{authorization:'Bearer access-1'});await response.text();expect(response.status).toBe(401);}
   expect(calls).toHaveLength(1);
  });
- it("coalesces concurrent inventory reads and replaces the manager only once",async()=>{
+ it("serializes concurrent inventory reads and replaces the manager only once",async()=>{
   const storage=createStorage(Date.now(),1),manager=new AccountManager(undefined,storage);
   let release!:()=>void,started!:()=>void;
   const gate=new Promise<void>(r=>release=r),entered=new Promise<void>(r=>started=r);
@@ -5825,9 +5906,10 @@ describe("native inventory read resilience",()=>{
   const {fetchImpl}=createRecordingFetch(()=>Response.json({models:[{slug:'model-test'}]}));
   const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readNativeAccountStorage:read}});mode.mockClear();
   const first=getModels(proxy);await entered;const second=getModels(proxy);
-  await vi.waitFor(()=>expect(readerCalls).toHaveBeenCalledTimes(2));
+  await new Promise(resolve=>setTimeout(resolve,50));
+  expect(readerCalls).toHaveBeenCalledTimes(1);
   release();await Promise.all([first.then(r=>r.text()),second.then(r=>r.text())]);
-  expect(read).toHaveBeenCalledTimes(1);expect(mode).toHaveBeenCalledTimes(1);
+  expect(read).toHaveBeenCalledTimes(2);expect(mode).toHaveBeenCalledTimes(1);
  });
  it("preserves unexpired 429 state across inventory changes",async()=>{
   const now=Date.now(),manager=new AccountManager(undefined,createStorage(now,1));
