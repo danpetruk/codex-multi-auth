@@ -31,6 +31,7 @@ const {
 	applyMonotonicAuthCooldown,
 	DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
 	ensureFreshAccessToken,
+	withRuntimeCredentialLock,
 	redirectRuntimeRefreshCommits,
 	resetRuntimeRefreshStateForTests,
 } = await import("../lib/runtime/rotation-token-refresh.js");
@@ -413,6 +414,40 @@ describe("ensureFreshAccessToken", () => {
 			access: "access-1",
 			refreshToken: "refresh-1",
 		});
+	});
+
+	it("restarts selection when a sync queued ahead of the commit disables the row", async () => {
+		const manager = managerWith(STALE_EXPIRES);
+		const commit = vi.spyOn(manager, "commitRefreshedAuth");
+		let lockHeld!: () => void;
+		let releaseLock!: () => void;
+		const held = new Promise<void>((resolve) => { lockHeld = resolve; });
+		// A storage sync holds the credential lock and disables the row on exit.
+		const sync = withRuntimeCredentialLock(manager, async () => {
+			lockHeld();
+			await new Promise<void>((resolve) => { releaseLock = resolve; });
+			const row = manager.getAccountByIndex(0);
+			if (row) row.enabled = false;
+		});
+		await held;
+		queuedRefreshMock.mockResolvedValue({
+			type: "success",
+			access: "rotated-access",
+			refresh: "rotated-refresh",
+			expires: NOW + 7_200_000,
+		});
+
+		const pending = ensureFreshAccessToken(refreshParams(manager));
+		// The refresh resolves while the row is still enabled, so the commit
+		// queues behind the sync's lock instead of failing the earlier check.
+		await vi.waitFor(() => expect(queuedRefreshMock).toHaveBeenCalledTimes(1));
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		releaseLock();
+		await sync;
+
+		expect(await pending).toMatchObject({ ok: false, retryable: true, selectionRestart: true, accountManager: manager });
+		expect(commit).not.toHaveBeenCalled();
+		expect(manager.getAccountByIndex(0)).toMatchObject({ enabled: false, refreshToken: "refresh-1" });
 	});
 
 	it("ignores an old refresh invalidation after the same row is repaired by re-login", async () => {

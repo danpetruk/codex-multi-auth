@@ -52,6 +52,11 @@ type RuntimeRefreshTarget = {
 type RuntimeRefreshCommitResult = {
 	accountManager: AccountManager;
 	account: ManagedAccount | null;
+	/**
+	 * Set when the commit did not run because a queued sync disabled the row
+	 * while the refresh was in flight. The caller must not dispatch with it.
+	 */
+	skipped?: "disabled";
 };
 
 let runtimeRefreshCommitQueues = new WeakMap<
@@ -233,8 +238,11 @@ async function commitRefreshedAuthOnce(
 	const pending = withRuntimeCredentialLock(commitManager, async () => {
 		const target = resolveRuntimeRefreshTarget(commitManager, account);
 		if (!target) return { accountManager: resolveRuntimeRefreshCommitManager(commitManager), account: null };
-		// A queued disk sync may have installed a newer login before this commit.
-		if (target.account.refreshToken !== expectedRefresh || target.account.enabled === false) return target;
+		// A queued disk sync may have disabled the row, or installed a newer login,
+		// before this commit. A disabled row is never dispatchable; a newer login
+		// is, with its own credential.
+		if (target.account.enabled === false) return { ...target, skipped: "disabled" as const };
+		if (target.account.refreshToken !== expectedRefresh) return target;
 		const updatedAccount = await target.accountManager.commitRefreshedAuth(target.account, auth);
 		return { accountManager: target.accountManager, account: updatedAccount };
 	}).finally(() => queue?.delete(key));
@@ -410,6 +418,16 @@ export async function ensureFreshAccessToken(params: {
 			latestTarget.account,
 			auth,
 		);
+		if (committed.skipped === "disabled") {
+			// Same outcome as the disabled check above: restart selection rather
+			// than hand back a disabled row and its possibly expired token.
+			return {
+				ok: false,
+				retryable: true,
+				selectionRestart: true,
+				accountManager: committed.accountManager,
+			};
+		}
 		// If commit succeeded, use the stored access token from the committed
 		// account ? this also handles the dedup case where two concurrent callers
 		// share one commit and both end up with the same committed token.

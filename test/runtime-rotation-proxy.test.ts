@@ -5321,6 +5321,26 @@ describe("native login isolation", () => {
 	});
 });
 
+/**
+ * Resolves once a proxy request asks for the credential lock after `arm()`.
+ * Arm it while another request holds the lock: the next entry is then the
+ * request under test, provably parked behind that lock, with no sleep.
+ */
+function watchCredentialLock() {
+  const original = tokenRefreshRuntime.withRuntimeCredentialLock;
+  let armed = false;
+  let reached!: () => void;
+  const parked = new Promise<void>(resolve => { reached = resolve; });
+  vi.spyOn(tokenRefreshRuntime, "withRuntimeCredentialLock").mockImplementation((target, operation) => {
+    if (armed) reached();
+    return original(target, operation);
+  });
+  return {arm: () => { armed = true; }, parked};
+}
+
+/** Lets every already-queued microtask run, without assuming any duration. */
+const drainMicrotasks = () => new Promise<void>(resolve => setImmediate(resolve));
+
 describe("provider re-login while router is running", () => {
   it("never installs an old disk snapshot while a refresh commit is saving", async () => {
     const storage = createStorage(Date.now(), 1);
@@ -5342,14 +5362,17 @@ describe("provider re-login while router is running", () => {
     const proxy = await startProxy({accountManager: manager, fetchImpl, options: {
       nativeOpenai: false, forcedAccountIndex: 0, readNativeAccountStorage: read,
     }});
+    const lock = watchCredentialLock();
     const first = postResponses(proxy, {model: "gpt-5.6-sol", stream: true});
     await entered;
+    lock.arm();
     const readCount = read.mock.calls.length;
     const second = postResponses(proxy, {model: "gpt-5.6-sol", stream: true});
     let responses: Response[] = [];
     try {
-      // Give the second HTTP request time to reach the credential boundary.
-      await new Promise(resolve => setTimeout(resolve, 60));
+      // The second request has reached the credential lock the commit holds.
+      await lock.parked;
+      await drainMicrotasks();
       expect(read).toHaveBeenCalledTimes(readCount);
       expect(manager.getAccountByIndex(0)?.refreshToken).toBe("rotated-refresh");
     } finally {
@@ -5905,8 +5928,10 @@ describe("native inventory read resilience",()=>{
   const mode=vi.spyOn(AccountManager.prototype,'setRoutingMutexMode');
   const {fetchImpl}=createRecordingFetch(()=>Response.json({models:[{slug:'model-test'}]}));
   const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readNativeAccountStorage:read}});mode.mockClear();
-  const first=getModels(proxy);await entered;const second=getModels(proxy);
-  await new Promise(resolve=>setTimeout(resolve,50));
+  const lock=watchCredentialLock();
+  const first=getModels(proxy);await entered;lock.arm();const second=getModels(proxy);
+  // The second request has reached the lock the first read holds.
+  await lock.parked;await drainMicrotasks();
   expect(readerCalls).toHaveBeenCalledTimes(1);
   release();await Promise.all([first.then(r=>r.text()),second.then(r=>r.text())]);
   expect(read).toHaveBeenCalledTimes(2);expect(mode).toHaveBeenCalledTimes(1);

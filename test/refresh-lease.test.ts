@@ -296,6 +296,50 @@ describe("RefreshLeaseCoordinator", () => {
     expect(fsOps.open).toHaveBeenCalled();
   });
 
+  it.each([
+    ["write", "EIO"],
+    ["close", "EPERM"],
+  ])("removes its own lock when the %s after an exclusive open fails (%s)", async (step, code) => {
+    const fail = () => Object.assign(new Error(`${step} failed`), { code });
+    const fsOps = {
+      mkdir: fsPromises.mkdir.bind(fsPromises),
+      open: vi.fn(async (path: string, flags: string, mode: number) => {
+        const handle = await fsPromises.open(path, flags, mode);
+        return {
+          writeFile: async (...args: Parameters<typeof handle.writeFile>) => {
+            if (step === "write") throw fail();
+            return handle.writeFile(...args);
+          },
+          close: async () => {
+            await handle.close();
+            if (step === "close") throw fail();
+          },
+        };
+      }) as unknown as typeof fsPromises.open,
+      writeFile: fsPromises.writeFile.bind(fsPromises),
+      rename: fsPromises.rename.bind(fsPromises),
+      unlink: vi.fn(fsPromises.unlink.bind(fsPromises)),
+      readFile: fsPromises.readFile.bind(fsPromises),
+      stat: fsPromises.stat.bind(fsPromises),
+      readdir: fsPromises.readdir.bind(fsPromises),
+    };
+    const refreshToken = `token-orphan-${step}`;
+    const lockPath = join(leaseDir, `${hashToken(refreshToken)}.lock`);
+    const failing = new RefreshLeaseCoordinator({ enabled: true, leaseDir, waitTimeoutMs: 80, pollIntervalMs: 20, fsOps });
+
+    const handle = await failing.acquire(refreshToken);
+
+    expect(handle.role).toBe("blocked");
+    expect(fsOps.unlink).toHaveBeenCalledWith(lockPath);
+    await expect(fsPromises.stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+    // Once the filesystem recovers, the token can be refreshed again instead
+    // of waiting out a lock nobody will ever release.
+    const healthy = new RefreshLeaseCoordinator({ enabled: true, leaseDir, waitTimeoutMs: 80, pollIntervalMs: 20 });
+    const owner = await healthy.acquire(refreshToken);
+    expect(owner.role).toBe("owner");
+    await owner.release();
+  });
+
   it("ignores mismatched result payload and stale results", async () => {
     const refreshToken = "token-result-paths";
     const tokenHash = hashToken(refreshToken);

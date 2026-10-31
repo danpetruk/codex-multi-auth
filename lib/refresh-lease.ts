@@ -242,8 +242,10 @@ export class RefreshLeaseCoordinator {
 				};
 			}
 
+			let createdLock = false;
 			try {
 				const handle = await this.fsOps.open(lockPath, "wx", 0o600);
+				createdLock = true;
 				const nonce = randomUUID();
 				try {
 					const now = Date.now();
@@ -274,6 +276,11 @@ export class RefreshLeaseCoordinator {
 					log.warn("Refresh lease acquisition failed; refresh blocked", {
 						error: error instanceof Error ? error.message : String(error),
 					});
+					// We created this lock exclusively and sent no OAuth request, so
+					// removing it is safe. Nothing else would: locks are never stolen
+					// or pruned, so an orphan would block this token's refresh until
+					// the next login.
+					if (createdLock) await safeUnlink(lockPath, undefined, this.fsOps);
 					return this.createBlockedHandle("acquire-error");
 				}
 

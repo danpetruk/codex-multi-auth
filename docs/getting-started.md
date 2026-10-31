@@ -31,7 +31,8 @@ Upgrading from the old prerelease package? See [the legacy note in upgrade.md](u
 
 ---
 
-Saved re-logins are adopted by a running router after this update is installed.
+Restart an already-running router once after installing this update; from then
+on it adopts saved re-logins without another restart.
 Refresh coordination errors are reported separately from invalid credentials; see
 [the upgrade notes](upgrade.md#live-credential-reload-and-refresh-coordination).
 
